@@ -29,7 +29,7 @@ def read_varint(f):
             raise ValueError("Varint too long")
     return result
 
-def _read_cell(f, dictionary):
+def _read_cell(f, dictionary, is_numeric_col=False, prev_row=None, col_idx=0):
     """Read a single cell with all encoding types."""
     flag = f.read(1)[0]
     
@@ -41,6 +41,19 @@ def _read_cell(f, dictionary):
     elif flag == 0x01:
         # Empty cell
         return ''
+    elif flag == 0xF7:
+        # Delta encoding
+        delta = struct.unpack('>d', f.read(8))[0]
+        if prev_row and col_idx < len(prev_row) and is_numeric_col:
+            try:
+                prev_val = float(prev_row[col_idx])
+                val = prev_val + delta
+                if val == int(val):
+                    return str(int(val))
+                return str(val)
+            except:
+                return str(delta)
+        return str(delta)
     elif flag == 0xFF:
         # Dictionary reference
         dict_idx = read_varint(f)
@@ -97,6 +110,17 @@ def decompress_min(filepath):
         file_type = f.read(1)[0]
         is_csv = (file_type == 1)
         
+        # Read numeric columns info for CSV (version 2+)
+        numeric_cols = set()
+        if version >= 2 and is_csv:
+            num_numeric_cols = read_varint(f)
+            for _ in range(num_numeric_cols):
+                col_idx = read_varint(f)
+                numeric_cols.add(col_idx)
+        elif version >= 2:
+            # Skip for text files
+            num_numeric_cols = read_varint(f)
+        
         # Read dictionary
         dict_size = read_varint(f)
         dictionary = {}
@@ -120,13 +144,15 @@ def decompress_min(filepath):
                     if is_csv:
                         col_count = read_varint(f)
                         row = []
-                        for _ in range(col_count):
-                            row.append(_read_cell(f, dictionary))
+                        prev_row = content[-1] if content else None
+                        for col_idx in range(col_count):
+                            cell = _read_cell(f, dictionary, col_idx in numeric_cols, prev_row, col_idx)
+                            row.append(cell)
                         # Repeat the row
                         for _ in range(count):
                             content.append(row[:])
                     else:
-                        line = _read_cell(f, dictionary)
+                        line = _read_cell(f, dictionary, False, None, 0)
                         # Repeat the line
                         for _ in range(count):
                             content.append(line)
@@ -135,11 +161,13 @@ def decompress_min(filepath):
                     if is_csv:
                         col_count = read_varint(f)
                         row = []
-                        for _ in range(col_count):
-                            row.append(_read_cell(f, dictionary))
+                        prev_row = content[-1] if content else None
+                        for col_idx in range(col_count):
+                            cell = _read_cell(f, dictionary, col_idx in numeric_cols, prev_row, col_idx)
+                            row.append(cell)
                         content.append(row)
                     else:
-                        line = _read_cell(f, dictionary)
+                        line = _read_cell(f, dictionary, False, None, 0)
                         content.append(line)
                 else:
                     raise ValueError(f"Unknown data marker: 0x{marker:02X}")

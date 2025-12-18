@@ -95,11 +95,68 @@ def build_dictionary(data, is_csv=False):
     for s, count in counter.most_common():
         s_bytes_len = len(s.encode('utf-8'))
         # Include if: appears 2+ times OR (single occurrence but long enough that reference is smaller)
-        if count >= 2 or (count == 1 and s_bytes_len > 10):  # Reference overhead ~2-3 bytes
+        # Lower threshold for dictionary inclusion
+        if count >= 2 or (count == 1 and s_bytes_len > 6):  # Reference overhead ~2-3 bytes
             dictionary[s] = idx
             idx += 1
     
     return dictionary
+
+def apply_delta_encoding(data, is_csv=False):
+    """Apply delta encoding for numeric sequences. Returns (encoded_data, numeric_cols)."""
+    if not data or not is_csv:
+        return data, set()
+    
+    # Detect numeric columns
+    num_cols = max(len(row) for row in data) if data else 0
+    numeric_cols = set()
+    
+    # Sample first 100 rows to detect numeric columns
+    sample_size = min(100, len(data))
+    for col_idx in range(num_cols):
+        numeric_count = 0
+        prev_val = None
+        for row_idx in range(sample_size):
+            if col_idx < len(data[row_idx]):
+                cell = data[row_idx][col_idx]
+                if is_numeric(cell):
+                    numeric_count += 1
+                    if prev_val is not None:
+                        try:
+                            float(cell) - float(prev_val)
+                        except:
+                            numeric_count = 0
+                            break
+                    prev_val = cell
+        if numeric_count >= sample_size * 0.8:  # 80% numeric
+            numeric_cols.add(col_idx)
+    
+    if not numeric_cols:
+        return data, set()
+    
+    # Apply delta encoding to numeric columns
+    encoded = []
+    prev_row = None
+    
+    for row in data:
+        new_row = []
+        for col_idx, cell in enumerate(row):
+            if col_idx in numeric_cols and prev_row and col_idx < len(prev_row) and is_numeric(cell) and is_numeric(prev_row[col_idx]):
+                try:
+                    delta = float(cell) - float(prev_row[col_idx])
+                    # Store delta if it's smaller than storing the original
+                    if abs(delta) < abs(float(cell)) * 0.8:  # Only if delta is significantly smaller
+                        new_row.append(('delta', delta))
+                    else:
+                        new_row.append(cell)
+                except:
+                    new_row.append(cell)
+            else:
+                new_row.append(cell)
+        encoded.append(new_row)
+        prev_row = row
+    
+    return encoded, numeric_cols
 
 def apply_run_length_encoding(data, is_csv=False):
     """Apply run-length encoding for consecutive repeated values."""
@@ -223,6 +280,11 @@ def save_min_format(filepath, content, is_csv=False):
         if is_csv:
             content = optimize_csv(content)
         
+        # Apply delta encoding for numeric sequences
+        numeric_cols = set()
+        if is_csv:
+            content, numeric_cols = apply_delta_encoding(content, is_csv)
+        
         # Apply run-length encoding
         rle_data = apply_run_length_encoding(content, is_csv)
         
@@ -240,6 +302,14 @@ def save_min_format(filepath, content, is_csv=False):
         buffer.write(b'\x02')  # Version 2 with enhanced compression
         # File type (0=text, 1=csv)
         buffer.write(b'\x01' if is_csv else b'\x00')
+        
+        # Write numeric columns info for CSV
+        if is_csv:
+            write_varint(buffer, len(numeric_cols))
+            for col_idx in sorted(numeric_cols):
+                write_varint(buffer, col_idx)
+        else:
+            write_varint(buffer, 0)
         
         # Write dictionary
         write_varint(buffer, len(dictionary))
@@ -261,24 +331,28 @@ def save_min_format(filepath, content, is_csv=False):
                 row = item[2]
                 if is_csv:
                     write_varint(buffer, len(row))
-                    for cell in row:
-                        _write_cell(buffer, cell, dictionary)
+                    for col_idx, cell in enumerate(row):
+                        _write_cell(buffer, cell, dictionary, col_idx in numeric_cols)
                 else:
-                    _write_cell(buffer, row, dictionary)
+                    _write_cell(buffer, row, dictionary, False)
             else:
                 # Normal data marker: 0xFD
                 buffer.write(b'\xFD')
                 row = item[1]
                 if is_csv:
                     write_varint(buffer, len(row))
-                    for cell in row:
-                        _write_cell(buffer, cell, dictionary)
+                    for col_idx, cell in enumerate(row):
+                        _write_cell(buffer, cell, dictionary, col_idx in numeric_cols)
                 else:
-                    _write_cell(buffer, row, dictionary)
+                    _write_cell(buffer, row, dictionary, False)
         
-        # Compress with LZMA (better compression than gzip)
+        # Compress with LZMA maximum settings
         buffer.seek(0)
-        compressed = lzma.compress(buffer.getvalue(), preset=9, format=lzma.FORMAT_ALONE)
+        # Use extreme compression preset with custom filters
+        filters = [
+            {"id": lzma.FILTER_LZMA2, "preset": 9, "dict_size": 64 * 1024 * 1024, "lc": 3, "lp": 0, "pb": 2}
+        ]
+        compressed = lzma.compress(buffer.getvalue(), format=lzma.FORMAT_ALONE, filters=filters)
         
         with open(output_path, 'wb') as f:
             f.write(compressed)
@@ -288,10 +362,18 @@ def save_min_format(filepath, content, is_csv=False):
         messagebox.showerror("Error", f"Failed to save file:\n{str(e)}")
         return None
 
-def _write_cell(buffer, cell, dictionary):
+def _write_cell(buffer, cell, dictionary, is_numeric_col=False):
     """Write a single cell with optimal encoding."""
     if not cell:
         buffer.write(b'\x01')  # Empty cell marker (0x01 to avoid conflict)
+        return
+    
+    # Handle delta encoding for numeric columns
+    if isinstance(cell, tuple) and cell[0] == 'delta':
+        buffer.write(b'\xF7')  # Delta marker
+        delta = cell[1]
+        # Encode delta as float
+        buffer.write(struct.pack('>d', delta))
         return
     
     # Try numeric encoding first
