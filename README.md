@@ -20,6 +20,6 @@
 
 ## Installation
 1. Install Python 3.9+ from [python.org](https://www.python.org/downloads/)
-2. (Optional) Install dependencies:
+2.  Install dependencies:
 ```bash
 pip install Pillow send2trash
