@@ -23,3 +23,7 @@
 2.  Install dependencies:
 ```bash
 pip install Pillow send2trash
+```
+---
+
+If you find this project useful, consider supporting me on [Buy Me a Coffee](https://buymeacoffee.com/enazzzz) ☕
